@@ -1,9 +1,25 @@
 name: ci
+# CI runs on pull requests that are ready for review and on each new commit to them. Merges into dev and main don't
+# re-run it, a new commit cancels the run it supersedes, and changes to Markdown alone run nothing.
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths-ignore:
+      - "**.md"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   rust:
-    runs-on: ubuntu-latest
+    # Drafts wait until they are marked ready for review.
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
