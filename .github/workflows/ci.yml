@@ -18,7 +18,7 @@ jobs:
   rust:
     # Drafts wait until they are marked ready for review.
     if: ${{ !github.event.pull_request.draft }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
