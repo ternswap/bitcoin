@@ -1,8 +1,16 @@
 [package]
 name = "tern-bitcoin-script"
-description = "Tern Bitcoin escrow scripts: Taproot lock scripts and PSBT builders for fulfill, expire, and reject spends."
+description = "Tern Bitcoin escrow script: the Taproot output of spec section 8 and the transactions that spend it."
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.99"
 license = "MIT"
 repository = "https://github.com/ternswap/bitcoin"
+
+[dependencies]
+bitcoin = "0.32"
+thiserror = "2.0.21"
+
+[dev-dependencies]
+# Downloads Bitcoin Core 30.2 at build time and checks its hash; BITCOIND_EXE overrides it.
+corepc-node = { version = "0.12", features = ["download", "30_2"] }
