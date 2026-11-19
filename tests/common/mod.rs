@@ -121,8 +121,9 @@ impl Regtest {
         .is_null()
     }
 
-    /// What the relayer and keeper do with pre-signed pairs (ADR-0001, decision 7): add a wallet input that pays
-    /// the fee and an output for its change, then sign that input. `prevouts` are what the existing inputs spend.
+    /// What the relayer and keeper do with pre-signed pairs (design/02-contracts.md, Bitcoin fees): add a wallet
+    /// input that pays the fee and an output for its change, then sign that input. `prevouts` are what the existing
+    /// inputs spend.
     pub fn add_fee(&self, mut tx: Transaction, prevouts: &[TxOut]) -> Transaction {
         let coin = self
             .rpc("listunspent", &[])

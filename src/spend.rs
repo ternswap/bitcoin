@@ -14,7 +14,7 @@ use bitcoin::{
 use crate::escrow::{Error, Escrow, Leaf, SECP};
 
 /// Covers one input and the output at the same index, nothing else: whoever broadcasts can add an input to
-/// pay the fee, and pairs from many escrows can share one transaction (ADR-0001).
+/// pay the fee, and pairs from many escrows can share one transaction (design/02-contracts.md, Bitcoin).
 pub const PAIR_SIGHASH: TapSighashType = TapSighashType::SinglePlusAnyoneCanPay;
 
 impl Escrow {
