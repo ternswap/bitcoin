@@ -7,8 +7,10 @@ use bitcoin::opcodes::all::{
 };
 use bitcoin::secp256k1::{All, Secp256k1};
 use bitcoin::sighash::TaprootError;
-use bitcoin::taproot::{ControlBlock, LeafVersion, TapLeafHash, TaprootBuilder, TaprootSpendInfo};
-use bitcoin::{Address, KnownHrp, Network, ScriptBuf};
+use bitcoin::taproot::{
+    ControlBlock, LeafVersion, SigFromSliceError, TapLeafHash, TaprootBuilder, TaprootSpendInfo,
+};
+use bitcoin::{Address, KnownHrp, Network, ScriptBuf, TapSighashType};
 
 pub(crate) static SECP: LazyLock<Secp256k1<All>> = LazyLock::new(Secp256k1::new);
 
@@ -38,6 +40,16 @@ pub enum Error {
     SameParty,
     #[error("cannot compute the sighash")]
     Sighash(#[from] TaprootError),
+    #[error("the prevout isn't this escrow's output")]
+    NotThisEscrow,
+    #[error("not a Taproot signature")]
+    NotASignature(#[from] SigFromSliceError),
+    #[error("signed with {0}, not SIGHASH_SINGLE|ANYONECANPAY, so no fee input can be added")]
+    NotAPair(TapSighashType),
+    #[error("the {0:?} leaf doesn't check this key's signature")]
+    NotTheLeafsKey(Leaf),
+    #[error("the signature doesn't verify for this pair")]
+    InvalidSignature(#[from] bitcoin::secp256k1::Error),
 }
 
 /// The escrow terms the script commits to. The asset is always BTC and the amount is the UTXO's value.
@@ -72,6 +84,14 @@ impl Escrow {
 
     pub fn expires_at(&self) -> u32 {
         self.expires_at
+    }
+
+    pub fn sender(&self) -> XOnlyPublicKey {
+        self.sender
+    }
+
+    pub fn receiver(&self) -> XOnlyPublicKey {
+        self.receiver
     }
 
     pub fn leaf_script(&self, leaf: Leaf) -> ScriptBuf {

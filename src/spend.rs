@@ -2,13 +2,14 @@ use std::borrow::Borrow;
 
 use bitcoin::absolute::LockTime;
 use bitcoin::hashes::Hash;
-use bitcoin::key::Keypair;
+use bitcoin::key::{Keypair, XOnlyPublicKey};
 use bitcoin::secp256k1::Message;
 use bitcoin::sighash::{Prevouts, SighashCache};
 use bitcoin::taproot::Signature;
 use bitcoin::transaction::Version;
 use bitcoin::{
-    Amount, OutPoint, ScriptBuf, Sequence, TapSighashType, Transaction, TxIn, TxOut, Witness,
+    Amount, OutPoint, ScriptBuf, Sequence, TapSighash, TapSighashType, Transaction, TxIn, TxOut,
+    Witness,
 };
 
 use crate::escrow::{Error, Escrow, Leaf, SECP};
@@ -48,6 +49,24 @@ impl Escrow {
         }
     }
 
+    /// The BIP-341 script-path sighash of `input` spending this escrow through `leaf`: what `sign` signs and
+    /// `verify_pair` checks.
+    pub fn sighash<T: Borrow<TxOut>>(
+        &self,
+        tx: &Transaction,
+        input: usize,
+        prevouts: &Prevouts<T>,
+        leaf: Leaf,
+        sighash_type: TapSighashType,
+    ) -> Result<TapSighash, Error> {
+        Ok(SighashCache::new(tx).taproot_script_spend_signature_hash(
+            input,
+            prevouts,
+            self.leaf_hash(leaf),
+            sighash_type,
+        )?)
+    }
+
     pub fn sign<T: Borrow<TxOut>>(
         &self,
         tx: &Transaction,
@@ -57,17 +76,50 @@ impl Escrow {
         sighash_type: TapSighashType,
         keypair: &Keypair,
     ) -> Result<Signature, Error> {
-        let sighash = SighashCache::new(tx).taproot_script_spend_signature_hash(
-            input,
-            prevouts,
-            self.leaf_hash(leaf),
-            sighash_type,
-        )?;
-        let message = Message::from_digest(sighash.to_raw_hash().to_byte_array());
+        let sighash = self.sighash(tx, input, prevouts, leaf, sighash_type)?;
+        let message = Message::from_digest(sighash.to_byte_array());
         Ok(Signature {
             signature: SECP.sign_schnorr_no_aux_rand(&message, keypair),
             sighash_type,
         })
+    }
+
+    /// Checks a pair signature someone else made, such as the user's pre-signed expire or claim: `signature` must be
+    /// `key`'s `SIGHASH_SINGLE|ANYONECANPAY` signature over this escrow's `leaf` spend of `utxo` that pays all of
+    /// `prevout` to `pay_to`. The transaction is rebuilt here, never taken from the signer, and `prevout` must come
+    /// from the chain.
+    pub fn verify_pair(
+        &self,
+        leaf: Leaf,
+        utxo: OutPoint,
+        prevout: &TxOut,
+        pay_to: ScriptBuf,
+        key: XOnlyPublicKey,
+        signature: &[u8],
+    ) -> Result<Signature, Error> {
+        if prevout.script_pubkey != self.script_pubkey() {
+            return Err(Error::NotThisEscrow);
+        }
+        let named = match leaf {
+            Leaf::Fulfill => key == self.receiver(),
+            Leaf::Expire => key == self.sender(),
+            Leaf::Reject => key == self.sender() || key == self.receiver(),
+        };
+        if !named {
+            return Err(Error::NotTheLeafsKey(leaf));
+        }
+        let signature = Signature::from_slice(signature)?;
+        if signature.sighash_type != PAIR_SIGHASH {
+            return Err(Error::NotAPair(signature.sighash_type));
+        }
+        let tx = self.spend_tx(leaf, utxo, pay_to, prevout.value);
+        let sighash = self.sighash(&tx, 0, &Prevouts::One(0, prevout), leaf, PAIR_SIGHASH)?;
+        SECP.verify_schnorr(
+            &signature.signature,
+            &Message::from_digest(sighash.to_byte_array()),
+            &key,
+        )?;
+        Ok(signature)
     }
 
     pub fn fulfill_witness(&self, receiver: &Signature, fulfillment: &[u8; 32]) -> Witness {
@@ -284,5 +336,145 @@ mod tests {
         let witness = escrow.reject_witness(&sender, &receiver);
         assert_eq!(witness.nth(0), Some(receiver.to_vec().as_slice()));
         assert_eq!(witness.nth(1), Some(sender.to_vec().as_slice()));
+    }
+
+    fn pair_bytes(leaf: Leaf, seed: u8) -> Vec<u8> {
+        let prevout = funded(&escrow());
+        let tx = escrow().spend_tx(leaf, utxo(), pay_to(), prevout.value);
+        sign_pair(leaf, &tx, &prevout, seed).to_vec()
+    }
+
+    fn verify(leaf: Leaf, seed: u8, signature: &[u8]) -> Result<Signature, Error> {
+        escrow().verify_pair(
+            leaf,
+            utxo(),
+            &funded(&escrow()),
+            pay_to(),
+            key(seed),
+            signature,
+        )
+    }
+
+    #[test]
+    fn a_pair_signed_by_a_key_its_leaf_names_verifies() {
+        for (leaf, seed) in [
+            (Leaf::Expire, 1),
+            (Leaf::Fulfill, 2),
+            (Leaf::Reject, 1),
+            (Leaf::Reject, 2),
+        ] {
+            assert!(
+                verify(leaf, seed, &pair_bytes(leaf, seed)).is_ok(),
+                "{leaf:?} by key {seed}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_key_the_leaf_does_not_name_is_refused() {
+        for (leaf, seed) in [(Leaf::Expire, 2), (Leaf::Fulfill, 1), (Leaf::Reject, 3)] {
+            assert_eq!(
+                verify(leaf, seed, &pair_bytes(leaf, seed)),
+                Err(Error::NotTheLeafsKey(leaf))
+            );
+        }
+    }
+
+    /// rust-bitcoin reads 64 bytes, and 65 ending in 0x00, as SIGHASH_DEFAULT: neither lets a fee input be added.
+    #[test]
+    fn only_single_anyonecanpay_counts_as_a_pair() {
+        let prevout = funded(&escrow());
+        let tx = escrow().spend_tx(Leaf::Expire, utxo(), pay_to(), prevout.value);
+        let prevouts = [prevout.clone()];
+        for sighash_type in [
+            TapSighashType::Default,
+            TapSighashType::All,
+            TapSighashType::AllPlusAnyoneCanPay,
+            TapSighashType::Single,
+        ] {
+            let signature = escrow()
+                .sign(
+                    &tx,
+                    0,
+                    &Prevouts::All(&prevouts),
+                    Leaf::Expire,
+                    sighash_type,
+                    &keypair(1),
+                )
+                .expect("sign");
+            assert_eq!(
+                verify(Leaf::Expire, 1, &signature.to_vec()),
+                Err(Error::NotAPair(sighash_type))
+            );
+        }
+        let mut zero = pair_bytes(Leaf::Expire, 1);
+        zero[64] = 0x00;
+        assert_eq!(
+            verify(Leaf::Expire, 1, &zero),
+            Err(Error::NotAPair(TapSighashType::Default))
+        );
+        assert!(matches!(
+            verify(Leaf::Expire, 1, &[1; 10]),
+            Err(Error::NotASignature(_))
+        ));
+    }
+
+    /// Bitcoin Core refuses the spend unless the control block commits to the prevout's script, so a signature over
+    /// another output, even one read from the chain, must not count as a working refund.
+    #[test]
+    fn a_prevout_that_is_not_this_escrows_output_is_refused() {
+        let escrow = escrow();
+        let mut other = funded(&escrow);
+        other.script_pubkey = ScriptBuf::new_p2tr(&SECP, key(8), None);
+        let tx = escrow.spend_tx(Leaf::Expire, utxo(), pay_to(), other.value);
+        let signature = sign_pair(Leaf::Expire, &tx, &other, 1).to_vec();
+        assert_eq!(
+            escrow.verify_pair(Leaf::Expire, utxo(), &other, pay_to(), key(1), &signature),
+            Err(Error::NotThisEscrow)
+        );
+    }
+
+    #[test]
+    fn a_signature_over_any_other_transaction_is_refused() {
+        let escrow = escrow();
+        let prevout = funded(&escrow);
+        let base = escrow.spend_tx(Leaf::Expire, utxo(), pay_to(), prevout.value);
+        let mut short = base.clone();
+        short.output[0].value = prevout.value - Amount::from_sat(1);
+        let mut elsewhere = base.clone();
+        elsewhere.output[0].script_pubkey = ScriptBuf::new_p2tr(&SECP, key(8), None);
+        let mut other_coin = base.clone();
+        other_coin.input[0].previous_output.vout = 1;
+        let mut final_input = base.clone();
+        final_input.input[0].sequence = Sequence::MAX;
+        let mut no_lock = base.clone();
+        no_lock.lock_time = LockTime::ZERO;
+        let reject = escrow.spend_tx(Leaf::Reject, utxo(), pay_to(), prevout.value);
+        let mut richer = prevout.clone();
+        richer.value = prevout.value + Amount::from_sat(1);
+        let forged = [
+            ("output value", sign_pair(Leaf::Expire, &short, &prevout, 1)),
+            ("address", sign_pair(Leaf::Expire, &elsewhere, &prevout, 1)),
+            (
+                "outpoint",
+                sign_pair(Leaf::Expire, &other_coin, &prevout, 1),
+            ),
+            (
+                "sequence",
+                sign_pair(Leaf::Expire, &final_input, &prevout, 1),
+            ),
+            ("lock time", sign_pair(Leaf::Expire, &no_lock, &prevout, 1)),
+            ("leaf", sign_pair(Leaf::Reject, &reject, &prevout, 1)),
+            ("prevout amount", sign_pair(Leaf::Expire, &base, &richer, 1)),
+        ];
+        for (what, signature) in forged {
+            assert!(
+                matches!(
+                    verify(Leaf::Expire, 1, &signature.to_vec()),
+                    Err(Error::InvalidSignature(_))
+                ),
+                "{what}"
+            );
+        }
     }
 }
