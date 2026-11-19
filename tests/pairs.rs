@@ -32,6 +32,16 @@ fn a_keeper_completes_a_presigned_refund_and_pays_the_fee() {
         )
         .expect("sign");
     pair.input[0].witness = escrow.expire_witness(&ota);
+    escrow
+        .verify_pair(
+            Leaf::Expire,
+            utxo,
+            &prevout,
+            pay_to(9),
+            key(1),
+            &ota.to_vec(),
+        )
+        .expect("the server accepts the upload");
 
     node.advance_to(escrow.expires_at() + 1);
     let tx = node.add_fee(pair, &[prevout]);
@@ -70,6 +80,16 @@ fn a_relayer_completes_a_presigned_claim_once_the_fulfillment_is_revealed() {
         .expect("sign");
     // The app sends the signature with the fulfillment; the relayer builds the witness.
     pair.input[0].witness = escrow.fulfill_witness(&ota, &fulfillment);
+    escrow
+        .verify_pair(
+            Leaf::Fulfill,
+            utxo,
+            &prevout,
+            pay_to(9),
+            key(1),
+            &ota.to_vec(),
+        )
+        .expect("the server accepts the claim signature");
 
     let tx = node.add_fee(pair, &[prevout]);
     node.confirm(&tx);
